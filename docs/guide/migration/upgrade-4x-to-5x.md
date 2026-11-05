@@ -306,7 +306,7 @@ Copy-Item root-ca.pem 'C:\Program Files (x86)\ossec-agent\certs\root-ca.pem'
 
 A remote upgrade from 4.14.X to 5.0.0 never rewrites `ossec.conf`: the file the 4.X agent had is the file the 5.0 agent reads, which is why the `<client>` fallback above exists.
 
-Before installing anything, the WPK installer checks that the manager answers HTTPS on the port/endpoint the upgraded agent will use, retrying a few times in case it's briefly unreachable, and aborts if it still does not. On hosts whose TLS stack can't negotiate the manager's TLS 1.3 minimum (e.g. EL7-era/Amazon Linux 2 system crypto libraries), the check falls back to a plain TCP connectivity check instead of treating that incompatibility as "manager unreachable":
+Before installing anything, the WPK installer checks that the manager answers HTTPS on the port/endpoint the upgraded agent will use, retrying a few times in case it's briefly unreachable, and aborts if it still does not. Where the system `curl` only lacks the `--tlsv1.3` option, as on macOS, the check runs the same HTTPS request without it, and the manager's TLS 1.3 minimum still applies. On hosts whose TLS stack can't negotiate the manager's TLS 1.3 minimum (e.g. EL7-era/Amazon Linux 2 system crypto libraries), the check falls back to a plain TCP connectivity check instead of treating that incompatibility as "manager unreachable":
 
 ```console
 2026/07/31 00:26:57 - Checking connectivity to MANAGER_IP:1517/wazuh-manager.

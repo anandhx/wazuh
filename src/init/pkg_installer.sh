@@ -285,17 +285,35 @@ probe_build_target() {
     fi
 }
 
+# curl with --tlsv1.3. A curl that rejects the option itself (exit 2 or 4: the macOS system curl,
+# or Amazon Linux 2's on OpenSSL 1.0.2) runs again without it: the manager accepts nothing below
+# TLS 1.3, so a handshake that succeeds was TLS 1.3. PROBE_CURL_RETRIED=1 lets the caller tell a
+# 35 from that retry (this host's TLS stack cannot do TLS 1.3) from a handshake failure.
+probe_curl() {
+    PROBE_CURL_RETRIED=0
+    curl --tlsv1.3 "$@"
+    PROBE_CURL_RC=$?
+    if [ ${PROBE_CURL_RC} -eq 2 ] || [ ${PROBE_CURL_RC} -eq 4 ]; then
+        PROBE_CURL_RETRIED=1
+        curl "$@"
+        PROBE_CURL_RC=$?
+    fi
+    return ${PROBE_CURL_RC}
+}
+
 probe_server() {
     PROBE_TIMEOUT=5
     probe_build_target "${1}" "${2}" "${3}"
 
     if command -v curl > /dev/null 2>&1; then
-        curl --tlsv1.3 -k -s -f -m ${PROBE_TIMEOUT} -o /dev/null "https://${PROBE_HOST}:${2}${PROBE_PATH}"
+        probe_curl -k -s -f -m ${PROBE_TIMEOUT} -o /dev/null "https://${PROBE_HOST}:${2}${PROBE_PATH}"
         RC=$?
         [ ${RC} -eq 0 ] && return 0
-        # Only exit 2/4 (this curl can't do TLS 1.3, #38607) falls through to TCP; the rest is real.
-        [ ${RC} -ne 2 ] && [ ${RC} -ne 4 ] && return ${RC}
-        echo "$(date +"%Y/%m/%d %H:%M:%S") - curl lacks TLS 1.3 support, falling back to a TCP connectivity check (manager endpoint not verified)." >> ./logs/upgrade.log
+        # Only a 35 from the retry (this host can't do TLS 1.3) falls through to TCP; the rest is real.
+        if [ ${PROBE_CURL_RETRIED} -ne 1 ] || [ ${RC} -ne 35 ]; then
+            return ${RC}
+        fi
+        echo "$(date +"%Y/%m/%d %H:%M:%S") - This host's curl cannot negotiate TLS 1.3, falling back to a TCP connectivity check (manager endpoint not verified)." >> ./logs/upgrade.log
     elif command -v wget > /dev/null 2>&1; then
         wget -q --no-check-certificate --timeout=${PROBE_TIMEOUT} --tries=1 -O /dev/null "https://${PROBE_HOST}:${2}${PROBE_PATH}"
         return $?
@@ -306,18 +324,24 @@ probe_server() {
     # kills bash (EXC_GUARD).
     ( : <>"/dev/tcp/${1}/${2}" ) > /dev/null 2>&1 &
     PROBE_PID=$!
-    WAITED=0
-    while kill -0 ${PROBE_PID} 2>/dev/null && [ ${WAITED} -lt ${PROBE_TIMEOUT} ]; do
-        sleep 1
-        WAITED=$((WAITED + 1))
-    done
-    if kill -0 ${PROBE_PID} 2>/dev/null; then
-        kill -9 ${PROBE_PID} 2>/dev/null
-        wait ${PROBE_PID} 2>/dev/null
-        return 1
-    fi
-    wait ${PROBE_PID}
-    return $?
+    # bash reports a job killed by a signal ("Killed: 9") on stderr, which is upgrade.log, whenever
+    # it reaps it: inside the loop as much as in the wait. Silence the whole block, not the wait.
+    {
+        WAITED=0
+        while kill -0 ${PROBE_PID} 2>/dev/null && [ ${WAITED} -lt ${PROBE_TIMEOUT} ]; do
+            sleep 1
+            WAITED=$((WAITED + 1))
+        done
+        if kill -0 ${PROBE_PID} 2>/dev/null; then
+            kill -9 ${PROBE_PID}
+            wait ${PROBE_PID}
+            PROBE_RC=1
+        else
+            wait ${PROBE_PID}
+            PROBE_RC=$?
+        fi
+    } 2>/dev/null
+    return ${PROBE_RC}
 }
 
 # Same target as probe_server(), but without -k: succeeds only if the system's own
@@ -326,23 +350,23 @@ probe_server() {
 # depends on TLS trust -- but it is exactly what AGENT_VERIFY_SYSTEM needs to work
 # post-upgrade. No TCP fallback here: a client that cannot do the real handshake
 # cannot tell us whether the cert is trusted, so treat that as "unverified" rather
-# than assume trust -- this deliberately stays fail-closed even for the curl-too-old
-# case below, since there is no way to positively confirm trust without the
-# handshake; only the log message distinguishes the two causes for the operator.
+# than assume trust -- this deliberately stays fail-closed even for a host whose TLS
+# stack cannot do TLS 1.3 (see probe_curl), since there is no way to positively confirm
+# trust without the handshake; only the log message distinguishes the two causes for
+# the operator.
 probe_server_verified() {
     PROBE_TIMEOUT=5
     probe_build_target "${1}" "${2}" "${3}"
 
     if command -v curl > /dev/null 2>&1; then
-        curl --tlsv1.3 -s -f -m ${PROBE_TIMEOUT} -o /dev/null "https://${PROBE_HOST}:${2}${PROBE_PATH}"
+        probe_curl -s -f -m ${PROBE_TIMEOUT} -o /dev/null "https://${PROBE_HOST}:${2}${PROBE_PATH}"
         RC=$?
-        # Mirrors probe_server()'s own curl-too-old handling (#38607): exit 2/4 means
-        # curl itself doesn't recognize --tlsv1.3, not that the handshake was
-        # attempted and failed -- worth a distinct log line so an operator doesn't
-        # mistake "this curl build is too old" for "the manager's certificate is
-        # untrusted".
-        if [ ${RC} -eq 2 ] || [ ${RC} -eq 4 ]; then
-            echo "$(date +"%Y/%m/%d %H:%M:%S") - curl lacks TLS 1.3 support, so the manager's certificate could not be verified (not the same as an untrusted certificate)." >> ./logs/upgrade.log
+        # Mirrors probe_server()'s handling of a host that cannot do TLS 1.3 (#38607): a 35
+        # from the retry means no handshake was possible, not that the certificate was
+        # rejected -- worth a distinct log line so an operator doesn't mistake "this host's
+        # TLS stack is too old" for "the manager's certificate is untrusted".
+        if [ ${PROBE_CURL_RETRIED} -eq 1 ] && [ ${RC} -eq 35 ]; then
+            echo "$(date +"%Y/%m/%d %H:%M:%S") - This host's curl cannot negotiate TLS 1.3, so the manager's certificate could not be verified (not the same as an untrusted certificate)." >> ./logs/upgrade.log
         fi
         return ${RC}
     elif command -v wget > /dev/null 2>&1; then
@@ -361,7 +385,7 @@ probe_server_with_ca() {
     probe_build_target "${1}" "${2}" "${3}"
 
     command -v curl > /dev/null 2>&1 || return 2
-    curl --tlsv1.3 --cacert "${4}" -s -f -m ${PROBE_TIMEOUT} -o /dev/null "https://${PROBE_HOST}:${2}${PROBE_PATH}"
+    probe_curl --cacert "${4}" -s -f -m ${PROBE_TIMEOUT} -o /dev/null "https://${PROBE_HOST}:${2}${PROBE_PATH}"
     case $? in
         # 22 is an HTTP error status, which only comes after a verified handshake.
         0|22) return 0 ;;
@@ -369,7 +393,7 @@ probe_server_with_ca() {
         # Some TLS backends report a failed verification as a generic handshake error: it was the
         # CA only if the same handshake succeeds without verification.
         35)
-            curl --tlsv1.3 -k -s -f -m ${PROBE_TIMEOUT} -o /dev/null "https://${PROBE_HOST}:${2}${PROBE_PATH}"
+            probe_curl -k -s -f -m ${PROBE_TIMEOUT} -o /dev/null "https://${PROBE_HOST}:${2}${PROBE_PATH}"
             case $? in
                 0|22) return 1 ;;
                 *) return 2 ;;
